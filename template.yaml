@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sanitized Bedrock lead-classification service with idempotency, SSM auth and X-Ray tracing.
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+  AuthParameterName:
+    Type: String
+    Default: /easyaigent/bedrock-classifier/api-key
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 15
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: bedrock-lead-classifier
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  RequestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ClassifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src.app.lambda_handler
+      Description: Low-risk lead classifier used behind an existing production fallback path.
+      Environment:
+        Variables:
+          MODEL_ID: !Ref ModelId
+          TABLE_NAME: !Ref RequestTable
+          AUTH_PARAM_NAME: !Ref AuthParameterName
+      Events:
+        Classify:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /classify
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestTable
+        - SSMParameterWithSlashPrefixReadPolicy:
+            ParameterName: !Ref AuthParameterName
+        - Statement:
+            - Sid: InvokeSelectedFoundationModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}
+            - Sid: XRayWriteOnly
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: '*'
+
+Outputs:
+  ApiUrl:
+    Description: HTTPS endpoint. The x-eai-key header is required by the Lambda authorization boundary.
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/classify
+  RequestTableName:
+    Value: !Ref RequestTable
